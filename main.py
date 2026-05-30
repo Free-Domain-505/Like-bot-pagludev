@@ -22,16 +22,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # === CONFIG ===
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("8832763338:AAHrEfsECFVNh8R0NKsq6Dw4tDe-3mvbbAc")
 
 if not BOT_TOKEN:
     logger.error("❌ BOT_TOKEN not found! Please set your bot token in environment variables.")
     sys.exit(1)
 
-REQUIRED_CHANNELS = ["@liketutorial001"]
-GROUP_JOIN_LINK = "https://t.me/liketutorialgroup"
-OWNER_ID = 5187492056
-OWNER_USERNAME = "@@itzpaglu"
+REQUIRED_CHANNELS = ["@liketes8766"]
+GROUP_JOIN_LINK = "https:/4/t.me/liketest988"
+OWNER_ID = 7388355190
+OWNER_USERNAME = "@@xanlos"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 like_tracker = {}   # in-memory cache
@@ -72,7 +72,7 @@ def is_user_in_channel(user_id):
 
 
 def call_api(region, uid):
-    url = f"https://your-api-domain//like?uid={uid}&server_name={region}"
+    url = f"https://free-fire-like-api-eosin.vercel.app//like?uid={uid}&server_name={region}"
     try:
         response = requests.get(url, timeout=20)
         if response.status_code != 200:
