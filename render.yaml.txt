@@ -1,5 +1,5 @@
 
-services:bagiiii
+bagi
   - type: web
     name: free-fire-bot
     env: python
