@@ -44,6 +44,7 @@ autolike_data = {}  # in-memory cache for autolike jobs
 # Default schedule in Asia/Kolkata: 7:00 AM, retry at 10:00 AM, retry at 1:00 PM
 AUTOLIKE_TIMES = ["07:00", "10:00", "13:00"]
 schedule_event = threading.Event()
+ist_tz = pytz.timezone("Asia/Kolkata")
 
 # Flask app for webhook
 app = Flask(__name__)
@@ -104,7 +105,6 @@ def reset_limits():
     """Daily reset of usage tracker (in-memory only)."""
     while True:
         try:
-            # Calculate time until next 00:00 UTC
             now_utc = datetime.utcnow()
             next_reset = (now_utc + timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0
@@ -120,7 +120,6 @@ def reset_limits():
 
 def daily_autolike_job():
     """Daily background job to send autolikes and retry failed UIDs at scheduled IST times."""
-    ist_tz = pytz.timezone("Asia/Kolkata")
     while True:
         try:
             if not AUTOLIKE_TIMES:
@@ -132,15 +131,13 @@ def daily_autolike_job():
             sleep_seconds = max(0, (target_time - now_ist).total_seconds())
 
             logger.info(
-                f"✅ Next Autolike scheduled in {int(sleep_seconds)} seconds ({format_12hr(slot_str)} IST)"
+                f"✅ Next Autolike scheduled in {int(sleep_seconds)}s ({format_12hr(slot_str)} IST)"
             )
 
             # Wait until target_time OR until /settime updates the schedule
             if schedule_event.wait(timeout=sleep_seconds):
                 schedule_event.clear()
-                logger.info(
-                    "🔄 Autolike schedule updated! Recalculating next run time..."
-                )
+                logger.info("🔄 Autolike schedule updated! Recalculating...")
                 continue
 
             # Execute likes for users who haven't received their daily like today
@@ -152,7 +149,6 @@ def daily_autolike_job():
                         args=(task_id, data, today_str, slot_str),
                     ).start()
 
-            # Small delay to avoid re-triggering on the exact same second
             time.sleep(2)
 
         except Exception as e:
@@ -169,41 +165,41 @@ def process_scheduled_like(task_id, data, today_str, slot_str):
     response = call_api(region, uid)
 
     if isinstance(response, dict) and response.get("status") == 1:
-        # Mark as succeeded today so retry slots skip this user today
         if task_id in autolike_data:
             autolike_data[task_id]["last_success_date"] = today_str
 
         player_uid = str(response.get("UID", uid)).strip()
         player_name = response.get("PlayerNickname", "N/A")
+        likes_before = str(response.get("LikesbeforeCommand", "N/A"))
+        likes_after = str(response.get("LikesafterCommand", "N/A"))
         likes_given = str(response.get("LikesGivenByAPI", "N/A"))
-        total_like = str(response.get("LikesafterCommand", "N/A"))
 
         msg = (
-            f"🌅 *Autolike Delivered! ({format_12hr(slot_str)} IST)* 🌅\n\n"
-            f"👤 *Name:* `{player_name}`\n"
-            f"🆔 *UID:* `{player_uid}`\n"
-            f"🌍 *Region:* `{region.upper()}`\n"
-            f"📈 *Likes Added:* `{likes_given}`\n"
-            f"🗿 *Total Likes Now:* `{total_like}`\n\n"
-            f"✨ _Apka daily autolike target pura hua!_"
+            f"✅ *Daily Autolike Delivered*\n\n"
+            f"👤 *Player:* `{player_name}`\n"
+            f"🆔 *UID:* `{player_uid}` (`{region.upper()}`)\n"
+            f"❤️ *Likes:* `{likes_before}` ➜ `{likes_after}` (`+{likes_given}`)\n"
+            f"🕒 *Time:* `{format_12hr(slot_str)} IST`"
         )
         bot.send_message(chat_id, msg, parse_mode="Markdown")
     else:
-        # Find remaining retry slots today
         remaining_slots = [
             format_12hr(t) for t in sorted(AUTOLIKE_TIMES) if t > slot_str
         ]
         if remaining_slots:
-            retry_note = f"🔄 _Next auto-retry today at: {', '.join(remaining_slots)} IST_"
+            retry_line = (
+                f"🔄 *Next Retry:* `{', '.join(remaining_slots)} IST`"
+            )
         else:
-            retry_note = f"⏳ _All retries finished for today. Will try again tomorrow at {format_12hr(sorted(AUTOLIKE_TIMES)[0])} IST._"
+            first_slot = format_12hr(sorted(AUTOLIKE_TIMES)[0])
+            retry_line = f"⏰ *Next Try:* `Tomorrow at {first_slot} IST`"
 
-        bot.send_message(
-            chat_id,
-            f"⚠️ *Autolike Failed* for UID `{uid}` at `{format_12hr(slot_str)} IST`.\n"
-            f"_Limit reached or API issue._\n{retry_note}",
-            parse_mode="Markdown",
+        msg = (
+            f"⚠️ *Autolike Failed* (`{format_12hr(slot_str)} IST`)\n\n"
+            f"🆔 *UID:* `{uid}` (`{region.upper()}`)\n"
+            f"{retry_line}"
         )
+        bot.send_message(chat_id, msg, parse_mode="Markdown")
 
 
 # === UTILS ===
@@ -226,23 +222,29 @@ def call_api(region, uid):
     try:
         response = requests.get(url, timeout=20)
         if response.status_code != 200:
-            return {
-                "⚠️Invalid": (
-                    " Maximum likes reached for today. Please try again"
-                    " tomorrow."
-                )
-            }
+            return {"status": 0}
         return response.json()
     except requests.exceptions.RequestException:
-        return {"error": "API Failed. Please try again later."}
+        return {"error": "API connection failed. Try again later."}
     except ValueError:
-        return {"error": "Invalid JSON response."}
+        return {"error": "Invalid response from server."}
 
 
 def get_user_limit(user_id):
     if user_id == OWNER_ID:
-        return 999999999  # Unlimited for owner
-    return 1  # 1 request per day for regular users
+        return 999999999
+    return 1
+
+
+def get_channel_markup():
+    markup = InlineKeyboardMarkup()
+    for channel in REQUIRED_CHANNELS:
+        markup.add(
+            InlineKeyboardButton(
+                f"🔗 Join {channel}", url=f"https://t.me/{channel.strip('@')}"
+            )
+        )
+    return markup
 
 
 # Start background threads
@@ -287,29 +289,21 @@ def webhook():
 def start_command(message):
     user_id = message.from_user.id
     if not is_user_in_channel(user_id):
-        markup = InlineKeyboardMarkup()
-        for channel in REQUIRED_CHANNELS:
-            markup.add(
-                InlineKeyboardButton(
-                    f"🔗 Join {channel}",
-                    url=f"https://t.me/{channel.strip('@')}",
-                )
-            )
         bot.reply_to(
             message,
-            "📢 Channel Membership Required\nTo use this bot, you must join all our channels first",
-            reply_markup=markup,
+            "📢 *Channel Membership Required*\nJoin our channel to use the bot:",
+            reply_markup=get_channel_markup(),
             parse_mode="Markdown",
         )
         return
     if user_id not in like_tracker:
         like_tracker[user_id] = {
             "used": 0,
-            "last_used": datetime.now() - timedelta(days=1),
+            "last_used": datetime.utcnow() - timedelta(days=1),
         }
     bot.reply_to(
         message,
-        "✅ You're verified! Use /like to send likes.",
+        "✅ *Verified!*\nUse `/like <region> <uid>` or `/autolike <region> <uid>`.",
         parse_mode="Markdown",
     )
 
@@ -319,51 +313,39 @@ def handle_like(message):
     user_id = message.from_user.id
     args = message.text.split()
 
-    if message.chat.type == "private" and message.from_user.id != OWNER_ID:
+    if message.chat.type == "private" and user_id != OWNER_ID:
         markup = InlineKeyboardMarkup()
         markup.add(
             InlineKeyboardButton("🔗 Join Official Group", url=GROUP_JOIN_LINK)
         )
         bot.reply_to(
             message,
-            "❌ Sorry! command is not allowed here.\n\nJoin our official group:",
+            "❌ Commands work only in our official group:",
             reply_markup=markup,
         )
         return
 
     if not is_user_in_channel(user_id):
-        markup = InlineKeyboardMarkup()
-        for channel in REQUIRED_CHANNELS:
-            markup.add(
-                InlineKeyboardButton(
-                    f"🔗 Join {channel}",
-                    url=f"https://t.me/{channel.strip('@')}",
-                )
-            )
         bot.reply_to(
             message,
-            "❌ You must join all our channels to use this command.",
-            reply_markup=markup,
+            "❌ Join our channel first to use this command:",
+            reply_markup=get_channel_markup(),
             parse_mode="Markdown",
         )
         return
 
-    if len(args) != 3:
-        bot.reply_to(
-            message, "❌ Format: `/like server_name uid`", parse_mode="Markdown"
-        )
-        return
-
-    region, uid = args[1], args[2]
-    if not region.isalpha() or not uid.isdigit():
+    if len(args) != 3 or not args[1].isalpha() or not args[2].isdigit():
         bot.reply_to(
             message,
-            "⚠️ Invalid input. Use: `/like server_name uid`",
+            "⚠️ *Usage:* `/like <region> <uid>`\n*Example:* `/like ind 12345678`",
             parse_mode="Markdown",
         )
         return
 
-    threading.Thread(target=process_like, args=(message, region, uid)).start()
+    region, uid = args[1].lower(), args[2]
+    threading.Thread(
+        target=process_like, args=(message, region, uid, False)
+    ).start()
 
 
 @bot.message_handler(commands=["autolike"])
@@ -379,47 +361,32 @@ def handle_autolike(message):
         )
         bot.reply_to(
             message,
-            "❌ Sorry! command is not allowed here.\n\nJoin our official group:",
+            "❌ Commands work only in our official group:",
             reply_markup=markup,
         )
         return
 
     if not is_user_in_channel(user_id):
-        markup = InlineKeyboardMarkup()
-        for channel in REQUIRED_CHANNELS:
-            markup.add(
-                InlineKeyboardButton(
-                    f"🔗 Join {channel}",
-                    url=f"https://t.me/{channel.strip('@')}",
-                )
-            )
         bot.reply_to(
             message,
-            "❌ You must join all our channels to use this command.",
-            reply_markup=markup,
+            "❌ Join our channel first to use this command:",
+            reply_markup=get_channel_markup(),
             parse_mode="Markdown",
         )
         return
 
-    if len(args) != 3:
+    if len(args) != 3 or not args[1].isalpha() or not args[2].isdigit():
         bot.reply_to(
             message,
-            "❌ Format: `/autolike server_name uid`\nExample: `/autolike ind 12345678`",
+            "⚠️ *Usage:* `/autolike <region> <uid>`\n*Example:* `/autolike ind 12345678`",
             parse_mode="Markdown",
         )
         return
 
-    region, uid = args[1], args[2]
-    if not region.isalpha() or not uid.isdigit():
-        bot.reply_to(
-            message,
-            "⚠️ Invalid input. Use: `/autolike server_name uid`",
-            parse_mode="Markdown",
-        )
-        return
-
-    # Register for daily scheduled autolike
+    region, uid = args[1].lower(), args[2]
     task_id = f"{user_id}_{region}_{uid}"
+
+    # Register UID for daily autolike
     autolike_data[task_id] = {
         "region": region,
         "uid": uid,
@@ -428,22 +395,10 @@ def handle_autolike(message):
         "last_success_date": None,
     }
 
-    schedule_display = ", ".join(format_12hr(t) for t in AUTOLIKE_TIMES)
-
-    # Safe formatting without problematic Markdown characters
-    reply_msg = (
-        f"🤖 ⚡ *AUTOLIKE ACTIVATED* ⚡ 🤖\n\n"
-        f"🌍 *Region:* `{region.upper()}`\n"
-        f"🎯 *Target UID:* `{uid}`\n\n"
-        f"🔥 Ek immediate request process kar raha hu...\n"
-        f"⏰ Daily Schedule (IST): *{schedule_display}*\n"
-        f"🔄 _(Agar first time me like nahi gaya to next time pe auto-retry hoga!)_\n\n"
-        f"🛑 Stop karne ke liye type kare: `/stopautolike {region} {uid}`"
-    )
-    bot.reply_to(message, reply_msg, parse_mode="Markdown")
-
-    # Fire immediate like
-    threading.Thread(target=process_like, args=(message, region, uid)).start()
+    # Immediately send today's like and show unified clean UI
+    threading.Thread(
+        target=process_like, args=(message, region, uid, True, task_id)
+    ).start()
 
 
 @bot.message_handler(commands=["stopautolike"])
@@ -454,25 +409,25 @@ def handle_stopautolike(message):
     if len(args) != 3:
         bot.reply_to(
             message,
-            "❌ Format: `/stopautolike server_name uid`\nExample: `/stopautolike ind 12345678`",
+            "⚠️ *Usage:* `/stopautolike <region> <uid>`\n*Example:* `/stopautolike ind 12345678`",
             parse_mode="Markdown",
         )
         return
 
-    region, uid = args[1], args[2]
+    region, uid = args[1].lower(), args[2]
     task_id = f"{user_id}_{region}_{uid}"
 
     if task_id in autolike_data:
         del autolike_data[task_id]
         bot.reply_to(
             message,
-            f"🚫 🛑 *Autolike Stopped* successfully for UID: `{uid}`.",
+            f"🛑 *Autolike Stopped* for UID `{uid}`.",
             parse_mode="Markdown",
         )
     else:
         bot.reply_to(
             message,
-            f"⚠️ Mujhe is UID (`{uid}`) ka koi active autolike nahi mila.",
+            f"⚠️ No active autolike found for UID `{uid}`.",
             parse_mode="Markdown",
         )
 
@@ -481,9 +436,7 @@ def handle_stopautolike(message):
 def handle_settime(message):
     """Owner command to view or update daily autolike and retry timings (Asia/Kolkata)."""
     if message.from_user.id != OWNER_ID:
-        bot.reply_to(
-            message, "❌ Only the bot owner can change autolike timings."
-        )
+        bot.reply_to(message, "❌ Owner only command.")
         return
 
     args = message.text.split()[1:]
@@ -491,11 +444,8 @@ def handle_settime(message):
         current_display = ", ".join(format_12hr(t) for t in AUTOLIKE_TIMES)
         bot.reply_to(
             message,
-            f"⏰ *Current Autolike Timings (Asia/Kolkata):*\n`{current_display}`\n\n"
-            f"📝 *Change karne ke liye format:*\n"
-            f"`/settime 07:00 10:00 13:00`\n"
-            f"ya\n"
-            f"`/settime 7am 10am 1pm`",
+            f"⏰ *Autolike Schedule (IST):*\n`{current_display}`\n\n"
+            f"*Update:* `/settime 7am 10am 1pm`",
             parse_mode="Markdown",
         )
         return
@@ -506,10 +456,7 @@ def handle_settime(message):
         if not parsed:
             bot.reply_to(
                 message,
-                f"⚠️ Invalid time: `{token}`\n\n"
-                f"✅ Examples:\n"
-                f"`/settime 07:00 10:00 13:00`\n"
-                f"`/settime 7am 10am 1pm`",
+                f"⚠️ Invalid time `{token}`.\n*Example:* `/settime 7am 10am 1pm`",
                 parse_mode="Markdown",
             )
             return
@@ -520,108 +467,135 @@ def handle_settime(message):
     AUTOLIKE_TIMES.clear()
     AUTOLIKE_TIMES.extend(parsed_times)
 
-    # Reset today's completion flag so newly set times can run today if needed
-    for task_ data in autolike_data.items():
+    for _, data in autolike_data.items():
         data["last_success_date"] = None
 
-    # Wake up scheduler thread to apply new timings immediately
     schedule_event.set()
 
     updated_display = ", ".join(format_12hr(t) for t in AUTOLIKE_TIMES)
     bot.reply_to(
         message,
-        f"✅ *Autolike Timings Updated (Asia/Kolkata):*\n"
-        f"🕒 `{updated_display}`\n\n"
-        f"📌 First slot pe sabko like jayega, aur jiska reh jayega uska next slot(s) pe auto-retry hoga!",
+        f"✅ *Schedule Updated (IST):*\n`{updated_display}`",
         parse_mode="Markdown",
     )
 
 
-def process_like(message, region, uid):
+def process_like(message, region, uid, is_autolike=False, task_id=None):
     user_id = message.from_user.id
     now_utc = datetime.utcnow()
+    today_ist = datetime.now(ist_tz).strftime("%Y-%m-%d")
     usage = like_tracker.get(
         user_id, {"used": 0, "last_used": now_utc - timedelta(days=1)}
     )
 
-    # Check if it's a new day (00:00 UTC reset)
-    last_used_date = usage["last_used"].date()
-    current_date = now_utc.date()
-    if current_date > last_used_date:
+    if now_utc.date() > usage["last_used"].date():
         usage["used"] = 0
 
     max_limit = get_user_limit(user_id)
+    schedule_display = ", ".join(format_12hr(t) for t in AUTOLIKE_TIMES)
+
+    # Check daily limit
     if usage["used"] >= max_limit:
-        bot.reply_to(message, f"⚠️ You have exceeded your daily request limit!")
+        if is_autolike:
+            if task_id and task_id in autolike_data:
+                autolike_data[task_id]["last_success_date"] = today_ist
+            bot.reply_to(
+                message,
+                f"✅ *Autolike Activated*\n\n"
+                f"🆔 *UID:* `{uid}` (`{region.upper()}`)\n"
+                f"ℹ️ *Today's Like:* Daily limit already used\n"
+                f"⏰ *Daily Schedule:* `{schedule_display} IST`\n"
+                f"🛑 *Stop:* `/stopautolike {region} {uid}`",
+                parse_mode="Markdown",
+            )
+        else:
+            bot.reply_to(message, "⚠️ Daily request limit reached. Try tomorrow!")
         return
 
-    processing_msg = bot.reply_to(message, "⏳ Please wait... Sending likes...")
+    status_text = (
+        "⏳ *Activating Autolike & sending today's likes...*"
+        if is_autolike
+        else "⏳ *Sending likes...*"
+    )
+    processing_msg = bot.reply_to(message, status_text, parse_mode="Markdown")
     response = call_api(region, uid)
 
-    if "error" in response:
+    # Handle API or limit failure
+    if (
+        "error" in response
+        or not isinstance(response, dict)
+        or response.get("status") != 1
+    ):
+        reason = (
+            response.get("error")
+            if isinstance(response, dict) and "error" in response
+            else "Max likes already reached for today"
+        )
+        if is_autolike:
+            fail_text = (
+                f"✅ *Autolike Activated*\n\n"
+                f"🆔 *UID:* `{uid}` (`{region.upper()}`)\n"
+                f"⚠️ *Today's Like:* {reason}\n"
+                f"🔄 *Auto-Retry Schedule:* `{schedule_display} IST`\n"
+                f"🛑 *Stop:* `/stopautolike {region} {uid}`"
+            )
+        else:
+            fail_text = f"❌ *Failed:* {reason}"
+
         try:
             bot.edit_message_text(
                 chat_id=processing_msg.chat.id,
                 message_id=processing_msg.message_id,
-                text=f"⚠️ API Error: {response['error']}",
+                text=fail_text,
+                parse_mode="Markdown",
             )
-        except:
-            bot.reply_to(message, f"⚠️ API Error: {response['error']}")
+        except Exception:
+            bot.reply_to(message, fail_text, parse_mode="Markdown")
         return
 
-    if not isinstance(response, dict) or response.get("status") != 1:
-        try:
-            bot.edit_message_text(
-                chat_id=processing_msg.chat.id,
-                message_id=processing_msg.message_id,
-                text=(
-                    "❌ UID has already received its max amount of likes. Limit"
-                    " reached for today, try another UID or after 24 hrs."
-                ),
-            )
-        except:
-            bot.reply_to(message, "⚠️ Invalid UID or unable to fetch data.")
-        return
-
+    # Success
     try:
         player_uid = str(response.get("UID", uid)).strip()
         player_name = response.get("PlayerNickname", "N/A")
-        region = str(response.get("Region", "N/A"))
+        res_region = str(response.get("Region", region)).upper()
         likes_before = str(response.get("LikesbeforeCommand", "N/A"))
         likes_after = str(response.get("LikesafterCommand", "N/A"))
         likes_given = str(response.get("LikesGivenByAPI", "N/A"))
-
-        total_like = likes_after
 
         usage["used"] += 1
         usage["last_used"] = now_utc
         like_tracker[user_id] = usage
 
-        response_text = (
-            "✅ *Request Processed Successfully*\n\n👤 *Name:*"
-            f" `{player_name}`\n🆔 *UID:* `{player_uid}`\n🌍 *Region:*"
-            f" `{region}`\n🤡 *Likes Before:* `{likes_before}`\n📈 *Likes"
-            f" Added:* `{likes_given}`\n🗿 *Total Likes Now:* `{total_like}`\n🔐"
-            f" *Remaining Requests:* `{max_limit - usage['used']}`\n👑 *Credit:*"
-            " @itzpaglu"
-        )
+        if is_autolike:
+            if task_id and task_id in autolike_data:
+                autolike_data[task_id]["last_success_date"] = today_ist
 
-        markup = InlineKeyboardMarkup()
+            response_text = (
+                f"✅ *Autolike Activated & Likes Sent*\n\n"
+                f"👤 *Player:* `{player_name}`\n"
+                f"🆔 *UID:* `{player_uid}` (`{res_region}`)\n"
+                f"❤️ *Likes:* `{likes_before}` ➜ `{likes_after}` (`+{likes_given}`)\n\n"
+                f"⏰ *Daily Schedule:* `{schedule_display} IST`\n"
+                f"🛑 *Stop:* `/stopautolike {region} {uid}`"
+            )
+        else:
+            response_text = (
+                f"✅ *Likes Sent Successfully*\n\n"
+                f"👤 *Player:* `{player_name}`\n"
+                f"🆔 *UID:* `{player_uid}` (`{res_region}`)\n"
+                f"❤️ *Likes:* `{likes_before}` ➜ `{likes_after}` (`+{likes_given}`)"
+            )
 
         bot.edit_message_text(
             chat_id=processing_msg.chat.id,
             message_id=processing_msg.message_id,
             text=response_text,
-            reply_markup=markup,
             parse_mode="Markdown",
         )
 
     except Exception as e:
         logger.error(f"Error in process_like: {e}")
-        bot.reply_to(
-            message,
-            "⚠️ Something went wrong. Likes Send, I can't decode your info.",
-        )
+        bot.reply_to(message, "⚠️ Likes sent, but failed to parse player info.")
 
 
 @bot.message_handler(commands=["remain"])
@@ -629,86 +603,54 @@ def owner_commands(message):
     if message.from_user.id != OWNER_ID:
         return
 
-    args = message.text.split()
-    cmd = args[0].lower()
-
-    if cmd == "/remain":
-        lines = ["📊 *Remaining Daily Requests Per User:*"]
-        if not like_tracker:
-            lines.append("❌ No users have used the bot yet today.")
-        else:
-            for uid, usage in like_tracker.items():
-                limit = get_user_limit(uid)
-                used = usage.get("used", 0)
-                limit_str = "Unlimited" if limit > 1000 else str(limit)
-                lines.append(f"👤 `{uid}` ➜ {used}/{limit_str}")
-        bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+    lines = ["📊 *Daily Usage:*"]
+    if not like_tracker:
+        lines.append("No requests today.")
+    else:
+        for uid, usage in like_tracker.items():
+            limit = get_user_limit(uid)
+            used = usage.get("used", 0)
+            limit_str = "∞" if limit > 1000 else str(limit)
+            lines.append(f"• `{uid}`: `{used}/{limit_str}`")
+    bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["help"])
 def help_command(message):
     user_id = message.from_user.id
 
-    if user_id == OWNER_ID:
-        help_text = (
-            f"📖 *Bot Commands:*\n\n"
-            f"🧑‍💻 `/like <region> <uid>` - Send likes immediately\n"
-            f"⏰ `/autolike <region> <uid>` - Daily auto likes with retry\n"
-            f"🚫 `/stopautolike <region> <uid>` - Stop daily likes\n"
-            f"🔰 `/start` - Start or verify\n"
-            f"🆘 `/help` - Show this help menu\n\n"
-            f"👑 *Owner Commands:*\n"
-            f"📈 `/remain` - Show all users' usage & stats\n"
-            f"🕒 `/settime <t1> <t2> ...` - Change autolike & retry timings\n\n"
-            f"📞 *Support:* {OWNER_USERNAME}"
-        )
-        bot.reply_to(message, help_text, parse_mode="Markdown")
-        return
-
-    if not is_user_in_channel(user_id):
-        markup = InlineKeyboardMarkup()
-        for channel in REQUIRED_CHANNELS:
-            markup.add(
-                InlineKeyboardButton(
-                    f"🔗 Join {channel}",
-                    url=f"https://t.me/{channel.strip('@')}",
-                )
-            )
+    if user_id != OWNER_ID and not is_user_in_channel(user_id):
         bot.reply_to(
             message,
-            "❌ You must join all our channels to use this command.",
-            reply_markup=markup,
+            "❌ Join our channel first to use this command:",
+            reply_markup=get_channel_markup(),
             parse_mode="Markdown",
         )
         return
 
+    schedule_display = ", ".join(format_12hr(t) for t in AUTOLIKE_TIMES)
     help_text = (
-        f"📖 *Bot Commands:*\n\n"
-        f"🧑‍💻 `/like <region> <uid>` - Send likes immediately\n"
-        f"⏰ `/autolike <region> <uid>` - Daily 7 AM likes\n"
-        f"🚫 `/stopautolike <region> <uid>` - Stop daily likes\n"
-        f"🔰 `/start` - Start or verify\n"
-        f"🆘 `/help` - Show this help menu\n\n"
-        f"📞 *Support:* {OWNER_USERNAME}\n"
-        f"🔗 Join our channels for updates!"
+        f"📖 *Commands*\n\n"
+        f"• `/like <region> <uid>` — Instant likes\n"
+        f"• `/autolike <region> <uid>` — Instant + Daily likes\n"
+        f"• `/stopautolike <region> <uid>` — Stop daily likes\n"
+        f"• `/start` — Verify membership\n\n"
+        f"⏰ *Schedule:* `{schedule_display} IST`"
     )
+
+    if user_id == OWNER_ID:
+        help_text += (
+            f"\n\n👑 *Owner*\n"
+            f"• `/settime <t1> <t2> ...` — Change schedule\n"
+            f"• `/remain` — View usage stats"
+        )
+
     bot.reply_to(message, help_text, parse_mode="Markdown")
 
 
 @bot.message_handler(func=lambda message: True, content_types=["text"])
 def reply_all(message):
     if message.text.startswith("/"):
-        known_commands = [
-            "/start",
-            "/like",
-            "/autolike",
-            "/stopautolike",
-            "/help",
-            "/remain",
-            "/settime",
-            "/timing",
-        ]
-        command = message.text.split()[0].lower()
         return
 
 
